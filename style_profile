@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""stylo_lab.py v2: Persian stylometry lab.
+ 
+What it is for
+  1. profile  : measure the style of a site or of one author, as RANGES, and (with
+                --background) say which features are actually distinctive.
+  2. check    : is a new or edited text still inside the author's own range?
+                The pass threshold is calibrated on the author's own texts (leave-one-out),
+                so the gate is never stricter than the author is with themself.
+  3. verify   : same-author test for an unknown text (General Impostors method,
+                Koppel & Winter 2014), self-calibrated, with an explicit "unknown" zone.
+  4. segment  : layer map of one long document (LLM-tidied / foreign orthography / rest).
+  5. fetch    : pull raw article text from a sitemap (run on your own machine).
+ 
+Design rules that came out of our experiments (2026-11-10)
+  * Feed RAW text. Normalizing first (or letting a chat model retype the text) erases the
+    orthographic layer, which was the strongest Persian signal we measured.
+  * Style is a set of RATIOS inside a range, not a list of habits. An edit that pushes a
+    habit above the author's own range is a caricature and is reported as such.
+  * A feature is part of a signature only if it is STABLE inside the author and
+    DISTINCTIVE against a background. Stable but not distinctive = language or house style.
+  * An LLM-tidied text behaves like a different author. It is flagged, and should be
+    removed from an author's reference corpus.
+  * Declared bylines, schema and profiles are metadata, never evidence.
+ 
+Usage
+  python3 stylo_lab.py profile --dir texts/author_x --name "X" [--background texts/others] --json x.json --md x.md
+  python3 stylo_lab.py check   --profile x.json --text edited.txt [--original before.txt]
+  python3 stylo_lab.py verify  --known texts/author_x --unknown q.txt --impostors texts/others [--layer raw|deep]
+  python3 stylo_lab.py segment --text long_doc.txt [--window 250]
+  python3 stylo_lab.py fetch   --sitemap https://site/sitemap.xml --n 60 --out texts/site   (pip install requests beautifulsoup4)
+ 
+One text per .txt/.md file. --background and --impostors may contain sub-folders.
+Minimum data for numbers that mean something: 8 texts of 500+ words for a profile;
+verify needs 3+ known texts and 5+ impostor texts of the same genre.
+Needs only the standard library; numpy is used when present (faster verify).
+"""
+import argparse, collections, glob, json, os, random, re, statistics as st, sys
+ 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None
+ 
+ZW = '‌'
+WORD = re.compile(r'[\w‌]+')
+SENT_SPLIT = re.compile(r'(?<=[.!؟?])\s+|\n+')
+ 
+BARE_TANVIN = (r'\b(?:اصلا|معمولا|حتما|کاملا|دقیقا|تقریبا|واقعا|لطفا|مثلا|قطعا|عملا|نسبتا|اتفاقا|ضمنا|اخیرا|فعلا|احتمالا|صرفا|'
+               r'لزوما|قبلا|بعدا|ظاهرا|اساسا|مستقیما|نهایتا|ترجیحا|عمدا|غالبا|عمدتا|شدیدا|طبیعتا)\b')
+MI_JOINED = (r'(?<![\w‌])ن?می(?:خوا|تو[ا]?ن|دان|دون|شو|شه|ش[ن]|کن|گوی|گ[ه]|رو|ر[ه]|بین|ده|گیر|رس|ساز|آی|یاب|نویس|خوان|'
+             r'کش|ذار|گذار|بر|پرس|افت|ماند|آور|دید|خور|زن|فهم)\w*')
+COLLOQUIAL = (r'\b(?:ن?می[‌ ]?(?:خوام|خوای|خواد|خوایم|خواین|تونم|تونی|تونه|تونیم|تونید|تونن|دونم|دونی|دونه|شه|کنه|کنن|'
+              r'گه|گن|گم|ره|رن|ذارم|ذاره|بینی|بینه)|یه|اون|اونا|اونها|اینا|رو|هستش|داره|دارن|باشه|بشه|نمیشه|میشه|بذار|بگیم|'
+              r'بریم|یکم|دیگه|خب|واسه|اگه|چیه|کیه|همینه)\b')
+FORMAL = r'\b(?:بلکه|زیرا|نیز|در واقع|همانند|چنین|به شمار|می‌باشد|می‌باشند|گردید|گردد|لذا|می‌توان)\b'
+HAMZA_ON = r'سؤال|تأثیر|تأمین|تأکید|تأیید|مسئول|مؤثر|مؤسسه|رأی|مسئله'
+HAMZA_OFF = r'سوال|تاثیر|تامین|تاکید|تایید|مسوول|موثر|موسسه|مساله'
+RELATIONS = {
+    'علت': ['چون', 'زیرا', 'چرا که', 'از آنجا که', 'به این دلیل که', 'برای اینکه', 'به خاطر اینکه'],
+    'تقابل': ['اما', 'ولی', 'با این حال', 'در مقابل', 'بااین‌حال', 'هرچند'],
+    'شرط': ['اگر', 'در صورتی که', 'چنانچه', 'به شرطی که'],
+    'نتیجه': ['پس', 'بنابراین', 'در نتیجه', 'به همین دلیل', 'برای همین', 'لذا'],
+    'افزودن': ['همچنین', 'علاوه بر این', 'علاوه‌براین', 'به‌علاوه', 'نیز'],
+    'مثال': ['مثلا', 'مثلاً', 'برای مثال', 'به عنوان مثال', 'به‌عنوان مثال'],
+}
+ 
+# name, family, Persian description. Rates are per 1000 words; *_share are 0..1; sent_* are words.
+FEATURES = [
+    ('mi_halfspace_share', 'رسم‌الخط', 'سهم «می» با نیم‌فاصله از همه «می»های فعلی'),
+    ('ha_halfspace_share', 'رسم‌الخط', 'سهم «ها»ی نیم‌فاصله از «ها»ی جدا و نیم‌فاصله'),
+    ('tanvin_share', 'رسم‌الخط', 'سهم قید با تنوین (مثلاً) از کل این قیدها'),
+    ('hamza_share', 'رسم‌الخط', 'سهم املای همزه‌دار (سؤال، تأثیر) از دو املا'),
+    ('joste_zw_share', 'رسم‌الخط', 'سهم «جست‌وجو» از «جستجو» و «جست‌وجو»'),
+    ('latin_digit_share', 'رسم‌الخط', 'سهم ارقام لاتین از همه ارقام'),
+    ('arabic_yk', 'رسم‌الخط', 'ی و ک عربی'),
+    ('heye', 'رسم‌الخط', '«ه‌ی» اضافه (زمینه‌ی)'),
+    ('he_hamze', 'رسم‌الخط', '«ۀ»'),
+    ('tashdid', 'رسم‌الخط', 'تشدید'),
+    ('space_before_punct', 'رسم‌الخط', 'فاصله پیش از نشانه'),
+    ('colloquial', 'لحن', 'فعل و ضمیر محاوره‌ای'),
+    ('ra', 'لحن', '«را»'),
+    ('ast', 'لحن', '«است»'),
+    ('formal', 'لحن', 'ربط و فعل رسمی (بلکه، زیرا، نیز، می‌باشد، می‌توان)'),
+    ('first_sg', 'لحن', 'اول‌شخص مفرد'),
+    ('first_pl', 'لحن', 'اول‌شخص جمع'),
+    ('second_pers', 'لحن', 'خطاب به خواننده'),
+    ('semicolon', 'نشانه‌گذاری', '؛'),
+    ('colon', 'نشانه‌گذاری', ':'),
+    ('comma', 'نشانه‌گذاری', '،'),
+    ('paren', 'نشانه‌گذاری', 'پرانتز'),
+    ('guillemet', 'نشانه‌گذاری', '«'),
+    ('exclam', 'نشانه‌گذاری', '!'),
+    ('question', 'نشانه‌گذاری', '؟'),
+    ('ellipsis', 'نشانه‌گذاری', 'سه‌نقطه'),
+    ('emoticon', 'نشانه‌گذاری', 'شکلک'),
+    ('list_semicolon_end', 'ساختار', 'سطر فهرست که با ؛ تمام می‌شود'),
+    ('para_mean', 'ساختار', 'میانگین طول پاراگراف (واژه)'),
+    ('sent_mean', 'جمله', 'میانگین طول جمله (واژه)'),
+    ('sent_sd', 'جمله', 'انحراف معیار طول جمله'),
+    ('sent_long_share', 'جمله', 'سهم جمله‌های بالای ۳۰ واژه'),
+    ('sent_short_share', 'جمله', 'سهم جمله‌های زیر ۸ واژه'),
+    ('latin_words', 'واژه', 'واژه با خط لاتین'),
+    ('ttr_200', 'واژه', 'تنوع واژگان (TTR پنجره ۲۰۰ واژه‌ای)'),
+]
+NAMES = [f[0] for f in FEATURES]
+DESC = {f[0]: (f[1], f[2]) for f in FEATURES}
+ 
+ 
+def read(path):
+    return open(path, encoding='utf-8', errors='replace').read().lstrip('﻿')
+ 
+ 
+def words(t):
+    return WORD.findall(t)
+ 
+ 
+def sentences(t):
+    return [s for s in SENT_SPLIT.split(t) if len(words(s)) >= 3]
+ 
+ 
+def share(a, b):
+    return a / (a + b) if (a + b) >= 3 else None  # fewer than 3 instances: not measurable
+ 
+ 
+def features(t):
+    w = words(t)
+    n = max(len(w), 1)
+    k = 1000 / n
+    f = {'_words': len(w)}
+    mi_zw = len(re.findall(r'(?<![\w‌])ن?می‌\w', t))
+    mi_other = len(re.findall(r'(?<![\w‌])ن?می \w{2,}', t)) + len(re.findall(MI_JOINED, t))
+    f['mi_halfspace_share'] = share(mi_zw, mi_other)
+    f['ha_halfspace_share'] = share(len(re.findall(r'\w‌ها', t)), len(re.findall(r'\w ها\b', t)))
+    f['tanvin_share'] = share(len(re.findall(r'\w+(?:اً|ًا)', t)), len(re.findall(BARE_TANVIN, t)))
+    f['hamza_share'] = share(len(re.findall(HAMZA_ON, t)), len(re.findall(HAMZA_OFF, t)))
+    f['joste_zw_share'] = share(len(re.findall(r'جست‌و‌?جو', t)), len(re.findall(r'جستجو', t)))
+    f['latin_digit_share'] = share(len(re.findall(r'[0-9]', t)), len(re.findall(r'[۰-۹٠-٩]', t)))
+    f['arabic_yk'] = (t.count('ي') + t.count('ك')) * k
+    f['heye'] = len(re.findall(r'ه‌ی\b', t)) * k
+    f['he_hamze'] = t.count('ۀ') * k
+    f['tashdid'] = t.count('ّ') * k
+    f['space_before_punct'] = len(re.findall(r' [،.؛:؟!]', t)) * k
+    f['colloquial'] = len(re.findall(COLLOQUIAL, t)) * k
+    f['ra'] = len(re.findall(r'\bرا\b', t)) * k
+    f['ast'] = len(re.findall(r'\bاست\b', t)) * k
+    f['formal'] = len(re.findall(FORMAL, t)) * k
+    f['first_sg'] = len(re.findall(r'\b(?:من|کردم|دارم|هستم|بودم|نوشتم|دیدم|می‌کنم|می‌گویم|می‌گم|نظرم)\b', t)) * k
+    f['first_pl'] = len(re.findall(r'\b(?:ما|کنیم|داریم|می‌کنیم|هستیم|بودیم|می‌خواهیم)\b', t)) * k
+    f['second_pers'] = len(re.findall(r'\b(?:شما|کنید|دارید|باشید|بنویسید|تو|کنی|داری|باشی)\b', t)) * k
+    f['semicolon'] = t.count('؛') * k
+    f['colon'] = t.count(':') * k
+    f['comma'] = t.count('،') * k
+    f['paren'] = t.count('(') * k
+    f['guillemet'] = t.count('«') * k
+    f['exclam'] = t.count('!') * k
+    f['question'] = (t.count('؟') + t.count('?')) * k
+    f['ellipsis'] = (t.count('...') + t.count('…')) * k
+    f['emoticon'] = (len(re.findall(r'[\U0001F300-\U0001FAFF☀-➿]', t)) + t.count(':)')) * k
+    f['list_semicolon_end'] = len(re.findall(r'؛\s*$', t, flags=re.M)) * k
+    paras = [len(words(p)) for p in t.split('\n') if len(words(p)) >= 15]
+    f['para_mean'] = st.mean(paras) if paras else None
+    sl = [len(words(s)) for s in sentences(t)]
+    if sl:
+        f['sent_mean'] = st.mean(sl)
+        f['sent_sd'] = st.pstdev(sl)
+        f['sent_long_share'] = sum(1 for x in sl if x > 30) / len(sl)
+        f['sent_short_share'] = sum(1 for x in sl if x < 8) / len(sl)
+    else:
+        f['sent_mean'] = f['sent_sd'] = f['sent_long_share'] = f['sent_short_share'] = None
+    f['latin_words'] = len(re.findall(r'[A-Za-z]{2,}', t)) * k
+    wl = [x.replace(ZW, '') for x in w]
+    tt = [len(set(wl[i:i + 200])) / 200 for i in range(0, len(wl) - 199, 200)]
+    f['ttr_200'] = st.mean(tt) if tt else None
+    return f
+ 
+ 
+def looks_llm(f):
+    """LLM-tidied heuristic (from round 1 and round 2). A hypothesis, not a verdict."""
+    s = 0
+    s += (f.get('mi_halfspace_share') or 0) >= 0.98
+    s += f.get('colloquial', 0) < 1
+    s += f.get('semicolon', 0) >= 15 or f.get('list_semicolon_end', 0) >= 5
+    s += f.get('formal', 0) >= 6
+    s += f.get('joste_zw_share') == 1 or f.get('hamza_share') == 1
+    s += f.get('heye', 0) == 0 and f.get('_words', 0) >= 300
+    return s >= 4
+ 
+ 
+def connectors(t):
+    out = {}
+    for rel, items in RELATIONS.items():
+        c = {i: len(re.findall(r'(?<![\w‌])' + re.escape(i) + r'(?![\w‌])', t)) for i in items}
+        out[rel] = {a: b for a, b in c.items() if b}
+    return out
+ 
+ 
+def openers(texts, top=15):
+    c = collections.Counter()
+    for t in texts:
+        for s in sentences(t):
+            w = words(s)
+            if w:
+                c[w[0]] += 1
+    return c.most_common(top)
+ 
+ 
+def load_dir(d):
+    paths = sorted(glob.glob(os.path.join(d, '**', '*.txt'), recursive=True) + glob.glob(os.path.join(d, '**', '*.md'), recursive=True))
+    return [(os.path.relpath(p, d), read(p)) for p in paths if not os.path.basename(p).startswith('_')]
+ 
+ 
+def quant(vals, p):
+    vals = sorted(vals)
+    if not vals:
+        return None
+    i = p * (len(vals) - 1)
+    lo, hi = int(i), min(int(i) + 1, len(vals) - 1)
+    return vals[lo] + (vals[hi] - vals[lo]) * (i - lo)
+ 
+ 
+def band(vals, is_share=False):
+    """Tolerance band of one feature: the middle half widened by one IQR on each side.
+    With zero IQR the band is the observed min..max. Rates cannot go below 0, shares stay in 0..1."""
+    p25, p75 = quant(vals, .25), quant(vals, .75)
+    iqr = p75 - p25
+    lo, hi = p25 - iqr, p75 + iqr
+    if iqr == 0:
+        lo, hi = min(vals), max(vals)
+    lo = max(lo, 0.0)
+    if is_share:
+        hi = min(hi, 1.0)
+    return lo, hi
+ 
+ 
+def summarize(feats):
+    out = {}
+    for name in NAMES:
+        vals = [f[name] for f in feats if f.get(name) is not None]
+        if len(vals) < 3:
+            out[name] = None
+            continue
+        is_share = name.endswith('_share')
+        lo, hi = band(vals, is_share)
+        mean = st.mean(vals)
+        cv = st.pstdev(vals) / mean if mean else 0
+        iqr = quant(vals, .75) - quant(vals, .25)
+        present = sum(1 for v in vals if v > 0) / len(vals)
+        tight = (iqr <= 0.15) if is_share else (cv <= 0.4)
+        if present <= 0.1:
+            status = 'قاعده: تقریباً هرگز'
+        elif present >= 0.8 and tight:
+            status = 'قاعده پایدار'
+        elif present >= 0.5:
+            status = 'گرایش'
+        else:
+            status = 'متغیر'
+        out[name] = dict(median=round(quant(vals, .5), 3), p25=round(quant(vals, .25), 3), p75=round(quant(vals, .75), 3),
+                         lo=round(lo, 3), hi=round(hi, 3), cv=round(cv, 2), present=round(present, 2), status=status, n=len(vals))
+    return out
+ 
+ 
+def out_of_band(f, summ):
+    """Features outside the author's band: (name, value, direction, exceedance).
+    Exceedance = distance outside the band in band-widths, capped at 3, so one wild feature cannot dominate."""
+    res = []
+    for name in NAMES:
+        s, v = summ.get(name), f.get(name)
+        if not s or v is None:
+            continue
+        width = s['hi'] - s['lo']
+        if width <= 0:
+            width = 0.1 if name.endswith('_share') else max(1.0, 0.25 * abs(s['hi']))
+        tol = 0.02 * width
+        if v > s['hi'] + tol:
+            res.append((name, v, 'above', min(3.0, (v - s['hi']) / width)))
+        elif v < s['lo'] - tol:
+            res.append((name, v, 'below', min(3.0, (s['lo'] - v) / width)))
+    return res
+ 
+ 
+def drift(miss):
+    return sum(m[3] for m in miss)
+ 
+ 
+# ---------- Burrows Delta ----------
+def mfw_list(texts, n=100):
+    c = collections.Counter(x.replace(ZW, '') for t in texts for x in words(t))
+    return [w for w, _ in c.most_common(n)]
+ 
+ 
+def relfreq(t, mfw):
+    w = [x.replace(ZW, '') for x in words(t)]
+    c = collections.Counter(w)
+    n = max(len(w), 1)
+    return [c[x] / n for x in mfw]
+ 
+ 
+def delta(a, b, sd):
+    return st.mean(abs(x - y) / s for x, y, s in zip(a, b, sd))
+ 
+ 
+def build_profile(texts, name, background=None):
+    feats = [features(t) for _, t in texts]
+    summ = summarize(feats)
+    warnings = []
+    nw = sum(f['_words'] for f in feats)
+    if len(texts) < 8:
+        warnings.append(f'فقط {len(texts)} متن: بازه‌ها توصیفی‌اند، نه معیار پذیرش (حداقل ۸ متن).')
+    if nw < 5000:
+        warnings.append(f'{nw} واژه: Delta ناپایدار است؛ به رسم‌الخط و لحن تکیه کنید.')
+    short = [tn for (tn, _), f in zip(texts, feats) if f['_words'] < 400]
+    if short:
+        warnings.append(f'{len(short)} متن کوتاه‌تر از ۴۰۰ واژه (نرخ‌هایشان پرنوسان است): ' + '، '.join(short[:6]))
+    llm = [tn for (tn, _), f in zip(texts, feats) if looks_llm(f)]
+    if llm:
+        warnings.append('نشانه لایه مدل زبانی؛ پیش از ساخت پروفایل نویسنده این متن‌ها را بازبینی یا حذف کنید: ' + '، '.join(llm[:8]))
+    # leave-one-out self calibration: how many features does the author's OWN text miss?
+    self_miss, self_drift = [], []
+    if len(texts) >= 5:
+        for i, f in enumerate(feats):
+            m = out_of_band(f, summarize([x for j, x in enumerate(feats) if j != i]))
+            self_miss.append(len(m)); self_drift.append(drift(m))
+    calib = None
+    if self_miss:
+        q1, q3 = quant(self_drift, .25), quant(self_drift, .75)
+        fence = q3 + 1.5 * (q3 - q1)
+        far = [f'{tn} ({d:.1f})' for (tn, _), d in zip(texts, self_drift) if d > fence and d > 1]
+        if far:
+            warnings.append(f'متن‌های دور از بقیه متن‌های همین پیکره (رانش بالاتر از حصار توکی {fence:.1f}): ' + '، '.join(far[:8]))
+        calib = dict(miss_median=quant(self_miss, .5), miss_p90=quant(self_miss, .9),
+                     drift_median=round(quant(self_drift, .5), 2), drift_p90=round(quant(self_drift, .9), 2),
+                     drift_values=[round(x, 2) for x in self_drift])
+    # Delta space: z-scale on background + own texts when a background exists
+    pool = [t for _, t in texts] + ([t for _, t in background] if background else [])
+    mfw = mfw_list(pool, 100)
+    vecs = [relfreq(t, mfw) for t in pool]
+    sd = [st.pstdev(c) or 1e-9 for c in zip(*vecs)]
+    own = vecs[:len(texts)]
+    centroid = [st.mean(c) for c in zip(*own)]
+    intra = None
+    if len(own) >= 5:
+        ds = []
+        for i, v in enumerate(own):
+            c = [st.mean(col) for col in zip(*[x for j, x in enumerate(own) if j != i])]
+            ds.append(delta(v, c, sd))
+        intra = dict(median=round(quant(ds, .5), 3), p90=round(quant(ds, .9), 3))
+    distinct = None
+    if background:
+        bf = [features(t) for _, t in background]
+        bs = summarize(bf)
+        distinct = []
+        for fn in NAMES:
+            a, b = summ.get(fn), bs.get(fn)
+            if not a or not b:
+                continue
+            spread = max(b['p75'] - b['p25'], a['p75'] - a['p25'], 0.05 * max(abs(b['median']), abs(a['median']), 1e-9), 1e-9)
+            eff = (a['median'] - b['median']) / spread
+            stable = a['status'].startswith('قاعده')
+            level = 'نه'
+            if abs(eff) >= 1:
+                level = 'قوی' if stable else 'ضعیف (ناپایدار در خود نویسنده)'
+            distinct.append(dict(feature=fn, author=a['median'], background=b['median'], effect=round(eff, 2), stable=stable, signature=level))
+        distinct.sort(key=lambda d: -abs(d['effect']))
+        if intra:
+            bvecs = vecs[len(texts):]
+            bd = [delta(v, centroid, sd) for v in bvecs]
+            intra['background_median'] = round(quant(bd, .5), 3)
+            intra['background_p10'] = round(quant(bd, .1), 3)
+    allt = '\n'.join(t for _, t in texts)
+    return dict(name=name, n_texts=len(texts), n_words=nw, features=summ, calibration=calib, intra_delta=intra,
+                distinctive=distinct, connectors=connectors(allt), openers=openers([t for _, t in texts]),
+                mfw=mfw, mfw_sd=sd, centroid=centroid, warnings=warnings,
+                per_text={tn: {k: (round(v, 3) if isinstance(v, float) else v) for k, v in f.items()} for (tn, _), f in zip(texts, feats)})
+ 
+ 
+def profile_md(p):
+    L = [f"# پروفایل سبک: {p['name']}", '', f"متن‌ها: {p['n_texts']}، واژه‌ها: {p['n_words']}", '']
+    if p['warnings']:
+        L += ['## هشدارها'] + [f'- {w}' for w in p['warnings']] + ['']
+    L += ['## ویژگی‌ها', '', '| خانواده | ویژگی | توضیح | میانه | باند مجاز | وضعیت |', '|---|---|---|---|---|---|']
+    for name in NAMES:
+        s = p['features'].get(name)
+        if s:
+            L.append(f"| {DESC[name][0]} | {name} | {DESC[name][1]} | {s['median']} | {s['lo']} تا {s['hi']} | {s['status']} |")
+    if p.get('distinctive'):
+        L += ['', '## چه چیزی واقعاً متمایز است (در برابر پیکره زمینه)', '',
+              'اثر = فاصله میانه نویسنده از میانه زمینه، به واحد پراکندگی. امضای قوی = پایدار در نویسنده و |اثر| ≥ ۱. پایدار ولی نامتمایز یعنی سبک زبان یا خانه، نه امضا.', '',
+              '| ویژگی | نویسنده | زمینه | اثر | پایدار | جزو امضا |', '|---|---|---|---|---|---|']
+        for d in p['distinctive'][:15]:
+            L.append(f"| {d['feature']} ({DESC[d['feature']][1]}) | {d['author']} | {d['background']} | {d['effect']} | {'بله' if d['stable'] else 'نه'} | {d['signature']} |")
+    L += ['', '## ربط‌ها (سهم هر ربط در رابطه خودش)', '']
+    for rel, c in p['connectors'].items():
+        tot = sum(c.values())
+        if tot:
+            L.append(f"- {rel} ({tot}): " + '، '.join(f'{a} {round(b / tot * 100)}٪' for a, b in sorted(c.items(), key=lambda x: -x[1])))
+    L += ['', '## آغازهای پرتکرار جمله', '', '، '.join(f'{w} ({c})' for w, c in p['openers'])]
+    if p.get('calibration'):
+        c = p['calibration']
+        L += ['', '## کالیبراسیون (leave-one-out)', '',
+              f"هر متن خود این نویسنده یک بار کنار گذاشته و با پروفایل بقیه سنجیده شد. تعداد ویژگی بیرون از باند: میانه {c['miss_median']:.0f}، صدک ۹۰ {c['miss_p90']:.0f}. "
+              f"امتیاز رانش (مجموع فاصله‌های بیرون از باند، به واحد پهنای باند): میانه {c['drift_median']}، صدک ۹۰ {c['drift_p90']}. "
+              "آستانه پذیرش check همین صدک ۹۰ رانش است؛ یعنی حدود ۱۰ درصد متن‌های خود نویسنده هم رد می‌شوند."]
+    if p.get('intra_delta'):
+        d = p['intra_delta']
+        s = f"Delta درونی: میانه {d['median']}، صدک ۹۰ {d['p90']}."
+        if 'background_median' in d:
+            s += f" Delta متن‌های زمینه تا مرکز این نویسنده: میانه {d['background_median']}، صدک ۱۰ {d['background_p10']}."
+            s += ' Delta فقط وقتی تفکیک می‌کند که صدک ۱۰ زمینه از صدک ۹۰ درونی بزرگ‌تر باشد.'
+        L += ['', s]
+    return '\n'.join(L) + '\n'
+ 
+ 
+def cmd_profile(a):
+    texts = load_dir(a.dir)
+    if not texts:
+        sys.exit('no .txt/.md files in ' + a.dir)
+    bg = None
+    if a.background:
+        own = {os.path.realpath(os.path.join(a.dir, n)) for n, _ in texts}
+        bg = [(n, t) for n, t in load_dir(a.background) if os.path.realpath(os.path.join(a.background, n)) not in own]
+        if len(bg) < 5:
+            sys.exit('background needs at least 5 texts that are not in --dir')
+    p = build_profile(texts, a.name or os.path.basename(os.path.normpath(a.dir)), bg)
+    md = profile_md(p)
+    if a.json:
+        json.dump(p, open(a.json, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    if a.md:
+        open(a.md, 'w', encoding='utf-8').write(md)
+    print(md)
+ 
+ 
+def cmd_check(a):
+    p = json.load(open(a.profile, encoding='utf-8'))
+    t = read(a.text)
+    f = features(t)
+    o = features(read(a.original)) if a.original else None
+    miss = out_of_band(f, p['features'])
+    missd = {m[0]: m for m in miss}
+    print(f"# سنجش «{os.path.basename(a.text)}» در برابر «{p['name']}» ({f['_words']} واژه)\n")
+    head = '| ویژگی | توضیح | متن | باند نویسنده | حکم |'
+    sep = '|---|---|---|---|---|'
+    if o:
+        head += ' پیش از ویرایش | جابه‌جایی |'; sep += '---|---|'
+    print(head); print(sep)
+    tested = 0; exag = 0
+    for name in NAMES:
+        s, v = p['features'].get(name), f.get(name)
+        if not s or v is None:
+            continue
+        tested += 1
+        m = missd.get(name)
+        verdict = 'در باند'
+        if m and m[2] == 'above':
+            if s['median'] > 0 and s['status'] != 'متغیر':
+                verdict = f'بالاتر از باند، در عادتی که نویسنده دارد (+{m[3]:.1f})'; exag += 1
+            else:
+                verdict = f'بالاتر از باند (+{m[3]:.1f})'
+        elif m:
+            verdict = f'پایین‌تر از باند (+{m[3]:.1f})'
+        row = f"| {name} | {DESC[name][1]} | {round(v, 3)} | {s['lo']} تا {s['hi']} | {verdict} |"
+        if o:
+            ov = o.get(name)
+            row += f" {'-' if ov is None else round(ov, 3)} | {'-' if ov is None else round(v - ov, 3)} |"
+        print(row)
+    vec = relfreq(t, p['mfw'])
+    d = delta(vec, p['centroid'], p['mfw_sd'])
+    dr = drift(miss)
+    cal, intra = p.get('calibration'), p.get('intra_delta')
+    thr = max(1.0, cal['drift_p90']) if cal else 3.0
+    print(f"\nبیرون از باند: {len(miss)} از {tested} ویژگی. امتیاز رانش: {dr:.2f} (آستانه کالیبره‌شده: {thr:.2f}).")
+    print(f"Delta تا مرکز نویسنده: {d:.3f}" + (f" (صدک ۹۰ درونی: {intra['p90']})" if intra else ''))
+    llm = looks_llm(f)
+    ok = dr <= thr and (not intra or d <= intra['p90'] * 1.1)
+    notes = []
+    if f['_words'] < 400:
+        notes.append('متن کوتاه‌تر از ۴۰۰ واژه است؛ حکم کم‌اعتبار است.')
+    if llm:
+        notes.append('نشانه لایه مدل زبانی دارد.')
+    if o:
+        pushed = [m[0] for m in miss if m[2] == 'above' and o.get(m[0]) is not None and f[m[0]] > o[m[0]]
+                  and p['features'][m[0]]['median'] > 0]
+        if len(pushed) >= 2 and not llm:
+            notes.append('الگوی کاریکاتور: ویرایش این عادت‌های نویسنده را از باند خودش بالاتر برده است: ' + '، '.join(pushed))
+    elif exag >= 2 and not llm:
+        notes.append(f'{exag} عادت نویسنده بالاتر از باند خود اوست؛ اگر این متن حاصل ویرایش است، با --original بسنجید که ویرایش آن را بالا برده یا نه.')
+    if not cal:
+        notes.append('پروفایل کالیبره نشده (کمتر از ۵ متن)؛ آستانه پیش‌فرض ۳ به کار رفت.')
+    if o:
+        od = drift(out_of_band(o, p['features']))
+        notes.append(f'رانش پیش از ویرایش: {od:.2f}؛ پس از ویرایش: {dr:.2f}.')
+    print('حکم: ' + ('درون محدوده نویسنده' if ok else 'بیرون از محدوده نویسنده'))
+    for n in notes:
+        print('- ' + n)
+ 
+ 
+# ---------- General Impostors verification ----------
+def deep_layer(t):
+    """Remove the orthographic layer so only word choice and syntax remain."""
+    t = t.replace(ZW, '').replace('ي', 'ی').replace('ك', 'ک').replace('ۀ', 'ه')
+    t = re.sub(r'[ً-ْ]', '', t)
+    t = re.sub(r'[0-9۰-۹٠-٩]+', '0', t)
+    t = re.sub(r'[،؛:.!؟?«»"()\[\]…\-–—*]', ' ', t)
+    return re.sub(r'\s+', ' ', t)
+ 
+ 
+def char_ngrams(t, n=4):
+    t = re.sub(r'\s+', ' ', t)
+    c = collections.Counter(t[i:i + n] for i in range(len(t) - n + 1))
+    tot = max(sum(c.values()), 1)
+    return {g: v / tot for g, v in c.items()}
+ 
+ 
+def impostor_score(u, known, imps, vocab, iters, rng):
+    """Share of trials in which a known text beats every sampled impostor (min-max similarity on a random half of the features)."""
+    if np is not None:
+        U = np.array([u.get(g, 0.0) for g in vocab])
+        K = np.array([[k.get(g, 0.0) for g in vocab] for k in known])
+        I = np.array([[i.get(g, 0.0) for g in vocab] for i in imps])
+        wins = 0; total = 0
+        m = len(vocab)
+        for _ in range(iters):
+            idx = rng.sample(range(m), m // 2)
+            pick = rng.sample(range(len(imps)), max(1, min(len(imps), len(imps) // 2 or 1)))
+            u_ = U[idx]
+            def sim(M):
+                M_ = M[:, idx]
+                return np.minimum(M_, u_).sum(1) / np.maximum(np.maximum(M_, u_).sum(1), 1e-12)
+            best_imp = sim(I[pick]).max()
+            sk = sim(K)
+            wins += int((sk > best_imp).sum()); total += len(known)
+        return wins / total
+    wins = 0; total = 0
+    for _ in range(max(10, iters // 5)):
+        idx = rng.sample(vocab, len(vocab) // 2)
+        pick = rng.sample(imps, max(1, len(imps) // 2))
+        def sim(a):
+            num = sum(min(a.get(g, 0), u.get(g, 0)) for g in idx); den = sum(max(a.get(g, 0), u.get(g, 0)) for g in idx)
+            return num / den if den else 0
+        best = max(sim(i) for i in pick)
+        for k in known:
+            wins += sim(k) > best; total += 1
+    return wins / total
+ 
+ 
+def cmd_verify(a):
+    prep = deep_layer if a.layer == 'deep' else (lambda x: x)
+    known = [(n, char_ngrams(prep(t))) for n, t in load_dir(a.known)]
+    imps = [(n, char_ngrams(prep(t))) for n, t in load_dir(a.impostors)]
+    unk = char_ngrams(prep(read(a.unknown)))
+    if len(known) < 3 or len(imps) < 5:
+        sys.exit('verify needs at least 3 known texts and 5 impostor texts')
+    pool = collections.Counter()
+    for _, d in known + imps:
+        for g, v in d.items():
+            pool[g] += v
+    vocab = [g for g, _ in pool.most_common(a.features)]
+    rng = random.Random(a.seed)
+    K = [d for _, d in known]; I = [d for _, d in imps]
+    score = impostor_score(unk, K, I, vocab, a.iters, rng)
+    # calibration: each known text against the rest (true same-author), each impostor against the known set (true different)
+    same = [impostor_score(K[i], K[:i] + K[i + 1:], I, vocab, a.iters, rng) for i in range(len(K))]
+    diff = [impostor_score(I[i], K, I[:i] + I[i + 1:], vocab, a.iters, rng) for i in range(len(I))]
+    lo_same, hi_diff = quant(same, .1), quant(diff, .9)
+    print(f"# وارسی نویسندگی (General Impostors، لایه {a.layer})\n")
+    print(f"متن‌های قطعی: {len(K)}، بدل‌ها: {len(I)}، ویژگی: {len(vocab)} چهارنگاشت حرفی، تکرار: {a.iters}\n")
+    print(f"امتیاز متن ناشناس: {round(score, 3)}")
+    print(f"کالیبراسیون، همان نویسنده (هر متن قطعی در برابر بقیه): میانه {round(quant(same, .5), 3)}، صدک ۱۰ {round(lo_same, 3)}")
+    print(f"کالیبراسیون، نویسنده دیگر (هر بدل در برابر متن‌های قطعی): میانه {round(quant(diff, .5), 3)}، صدک ۹۰ {round(hi_diff, 3)}")
+    if lo_same <= hi_diff:
+        print('\nهشدار: دو توزیع کالیبراسیون روی هم افتاده‌اند؛ با این داده و این لایه، روش نویسنده را از بدل‌ها جدا نمی‌کند.')
+        verdict = 'نامعلوم'
+    elif score >= lo_same:
+        verdict = 'سازگار با همان نویسنده'
+    elif score <= hi_diff:
+        verdict = 'ناسازگار با این نویسنده'
+    else:
+        side = 'نزدیک‌تر به همان نویسنده' if (score - hi_diff) > (lo_same - score) else 'نزدیک‌تر به نویسنده دیگر'
+        verdict = f'نامعلوم (میان دو توزیع، {side})'
+    print('\nحکم: ' + verdict)
+    print('این حکم «قوت شاهد» است، نه اثبات. لایه raw رسم‌الخط را هم می‌بیند (ویراستار و مدل زبانی آن را عوض می‌کنند)؛ لایه deep فقط واژه و نحو را.')
+ 
+ 
+def cmd_segment(a):
+    lines = read(a.text).split('\n')
+    wins = []; cur = []; start = 0; n = 0
+    for i, l in enumerate(lines):
+        if not l.strip():
+            continue
+        if not cur:
+            start = i
+        cur.append(l); n += len(words(l))
+        if n >= a.window:
+            wins.append((start, i, '\n'.join(cur))); cur = []; n = 0
+    if cur:
+        wins.append((start, len(lines) - 1, '\n'.join(cur)))
+    keys = ['semicolon', 'list_semicolon_end', 'heye', 'colloquial', 'formal', 'arabic_yk', 'tanvin_share', 'hamza_share', 'joste_zw_share', 'he_hamze', 'tashdid', 'first_sg', 'second_pers', 'sent_mean']
+    print('| پنجره | خط‌ها | واژه | ' + ' | '.join(keys) + ' | برچسب |')
+    print('|' + '---|' * (len(keys) + 4))
+    seq = ''
+    for k, (s, e, w) in enumerate(wins):
+        f = features(w)
+        lab = 'M' if looks_llm(f) else ('C' if (f['arabic_yk'] > 2 or f['he_hamze'] > 2 or f['tashdid'] > 3 or (f['tanvin_share'] or 0) >= 0.8) else 'H')
+        seq += lab
+        print(f"| {k} | {s}-{e} | {f['_words']} | " + ' | '.join('-' if f[x] is None else str(round(f[x], 2)) for x in keys) + f' | {lab} |')
+    print('\nنقشه: ' + seq)
+    print('M = نشانه لایه مدل زبانی؛ C = رسم‌الخط بیگانه نسبت به بقیه سند (کپی یا ترجمه محتمل)؛ H = بقیه.')
+    print('برچسب‌ها فرضیه‌اند. تفکیک آدم‌ها از هم با این فرمان انجام نمی‌شود و به متن مرجع نیاز دارد (verify).')
+ 
+ 
+def cmd_fetch(a):
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+    except ImportError:
+        sys.exit('pip install requests beautifulsoup4')
+    hdr = {'User-Agent': 'Mozilla/5.0 (compatible; stylometry-research)'}
+    urls = []
+ 
+    def walk(sm, depth=0):
+        try:
+            x = requests.get(sm, headers=hdr, timeout=30).text
+        except Exception as e:
+            print('sitemap error', sm, e); return
+        for u in re.findall(r'<loc>\s*(?:<!\[CDATA\[)?\s*([^<\]]+?)\s*(?:\]\]>)?\s*</loc>', x):
+            if re.search(r'\.xml(?:\.gz)?(?:\?|$)', u) or 'sitemap' in u.lower():
+                if depth < 2:
+                    walk(u, depth + 1)
+            else:
+                urls.append(u)
+    for sm in a.sitemap:
+        walk(sm)
+    urls = sorted(set(urls))
+    random.Random(a.seed).shuffle(urls)
+    os.makedirs(a.out, exist_ok=True)
+    meta = []; got = 0
+    for u in urls:
+        if got >= a.n:
+            break
+        try:
+            r = requests.get(u, headers=hdr, timeout=30)
+            r.encoding = r.apparent_encoding or 'utf-8'
+            soup = BeautifulSoup(r.text, 'html.parser')
+        except Exception:
+            continue
+        declared = ''
+        m = soup.find('meta', attrs={'name': 'author'})
+        if m and m.get('content'):
+            declared = m['content'].strip()
+        for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'form', 'noscript']):
+            tag.decompose()
+        root = soup.find(attrs={'itemprop': 'articleBody'}) or soup.find('article') or soup.body
+        if not root:
+            continue
+        paras = [p.get_text('', strip=False).strip() for p in root.find_all(['p', 'li', 'h2', 'h3', 'blockquote'])]
+        text = '\n'.join(p for p in paras if len(p) > 30)
+        if len(words(text)) < a.min_words:
+            continue
+        got += 1
+        fn = f'{got:03d}.txt'
+        open(os.path.join(a.out, fn), 'w', encoding='utf-8').write(text + '\n')
+        meta.append(dict(file=fn, url=u, words=len(words(text)), declared_byline=declared))
+        print(got, len(words(text)), u)
+    json.dump(meta, open(os.path.join(a.out, '_meta.json'), 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    print(f'{got} texts saved. declared_byline is metadata only, not evidence of authorship.')
+ 
+ 
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest='cmd', required=True)
+    p = sp.add_parser('profile'); p.add_argument('--dir', required=True); p.add_argument('--name'); p.add_argument('--background'); p.add_argument('--json'); p.add_argument('--md'); p.set_defaults(fn=cmd_profile)
+    p = sp.add_parser('check'); p.add_argument('--profile', required=True); p.add_argument('--text', required=True); p.add_argument('--original'); p.set_defaults(fn=cmd_check)
+    p = sp.add_parser('verify'); p.add_argument('--known', required=True); p.add_argument('--unknown', required=True); p.add_argument('--impostors', required=True)
+    p.add_argument('--layer', choices=['raw', 'deep'], default='raw'); p.add_argument('--iters', type=int, default=100); p.add_argument('--features', type=int, default=2000); p.add_argument('--seed', type=int, default=1); p.set_defaults(fn=cmd_verify)
+    p = sp.add_parser('segment'); p.add_argument('--text', required=True); p.add_argument('--window', type=int, default=250); p.set_defaults(fn=cmd_segment)
+    p = sp.add_parser('fetch'); p.add_argument('--sitemap', action='append', required=True); p.add_argument('--n', type=int, default=60); p.add_argument('--out', required=True)
+    p.add_argument('--min-words', type=int, default=400); p.add_argument('--seed', type=int, default=1); p.set_defaults(fn=cmd_fetch)
+    a = ap.parse_args()
+    a.fn(a)
+ 
+ 
+if __name__ == '__main__':
+    main()
+ 
